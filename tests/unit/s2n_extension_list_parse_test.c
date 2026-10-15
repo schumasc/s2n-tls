@@ -267,7 +267,13 @@ int main()
         EXPECT_SUCCESS(s2n_stuffer_free(&stuffer));
     };
 
-    /* Test parse single extension in list - ignore unknown extensions */
+    /* Test parse single extension in list - ignore unknown extensions.
+     *
+     * Unknown extensions are still counted on the wire so that the
+     * "pre_shared_key must be the last extension" check in
+     * s2n_client_psk_recv reflects true wire position (RFC8446 4.2.11),
+     * but no parsed_extension slot is populated for them.
+     */
     {
         s2n_parsed_extensions_list parsed_extension_list = { 0 };
         struct s2n_stuffer stuffer = { 0 };
@@ -286,7 +292,7 @@ int main()
         EXPECT_SUCCESS(s2n_extension_list_parse(&stuffer, &parsed_extension_list));
 
         EXPECT_EQUAL(s2n_stuffer_data_available(&stuffer), 0);
-        EXPECT_EQUAL(parsed_extension_list.count, 0);
+        EXPECT_EQUAL(parsed_extension_list.count, 1);
         EXPECT_PARSED_EXTENSION_LIST_EMPTY(parsed_extension_list);
         EXPECT_RAW_EQUAL(parsed_extension_list, stuffer);
 
@@ -370,7 +376,8 @@ int main()
         EXPECT_PARSED_EXTENSION_EQUAL(parsed_extension_list, test_extension_2.iana_value, test_data, 0);
         EXPECT_PARSED_EXTENSION_EQUAL(parsed_extension_list, test_extension_3.iana_value, other_test_data, sizeof(other_test_data));
         EXPECT_RAW_EQUAL(parsed_extension_list, stuffer);
-        EXPECT_EQUAL(parsed_extension_list.count, 3);
+        /* 3 recognized + 1 unrecognized extension were on the wire. */
+        EXPECT_EQUAL(parsed_extension_list.count, 4);
 
         CLEAR_PARSED_EXTENSION(parsed_extension_list, test_extension.iana_value);
         CLEAR_PARSED_EXTENSION(parsed_extension_list, test_extension_2.iana_value);
@@ -406,13 +413,19 @@ int main()
 
         EXPECT_SUCCESS(s2n_extension_list_parse(&stuffer, &parsed_extension_list));
 
+        /* Written order: test_extension (0), test_extension_2 (1),
+         * unknown/GREASE (2), test_extension_3 (3). Unknown extensions still
+         * consume a wire index so the "last extension" invariant used by
+         * s2n_client_psk_recv matches true wire position.
+         */
+        uint16_t expected_wire_index[] = { 0, 1, 3 };
         uint16_t expected_order[] = { test_extension.iana_value, test_extension_2.iana_value, test_extension_3.iana_value };
         for (size_t i = 0; i < s2n_array_len(expected_order); i++) {
             s2n_extension_type_id id = 0;
             EXPECT_SUCCESS(s2n_extension_supported_iana_value_to_id(expected_order[i], &id));
-            EXPECT_EQUAL(parsed_extension_list.parsed_extensions[id].wire_index, i);
+            EXPECT_EQUAL(parsed_extension_list.parsed_extensions[id].wire_index, expected_wire_index[i]);
         }
-        EXPECT_EQUAL(parsed_extension_list.count, 3);
+        EXPECT_EQUAL(parsed_extension_list.count, 4);
 
         EXPECT_SUCCESS(s2n_stuffer_free(&stuffer));
     };

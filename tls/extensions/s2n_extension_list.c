@@ -134,9 +134,21 @@ static int s2n_extension_parse(struct s2n_stuffer *in, s2n_parsed_extension *par
     uint8_t *extension_data = s2n_stuffer_raw_read(in, extension_size);
     POSIX_ENSURE(extension_data != NULL, S2N_ERR_BAD_MESSAGE);
 
+    /* Every extension read from the wire advances the wire index, including
+     * unrecognized ones. This is required so that parsed_extension_list->count
+     * accurately reflects the number of extensions on the wire and so that the
+     * server-side RFC8446 Section 4.2.11 "pre_shared_key must be the last
+     * extension" check (s2n_client_psk_recv) verifies true wire position
+     * rather than position within the filtered set of recognized extensions.
+     * See https://www.rfc-editor.org/rfc/rfc8701 (GREASE) for an example of
+     * why extensions s2n does not recognize must still occupy a wire slot.
+     */
     s2n_extension_type_id extension_id = 0;
     if (s2n_extension_supported_iana_value_to_id(extension_type, &extension_id) != S2N_SUCCESS) {
-        /* Ignore unknown extensions */
+        /* Ignore unknown extensions, but still count them so that the
+         * "last extension" check sees the true wire layout.
+         */
+        (*wire_index)++;
         return S2N_SUCCESS;
     }
 
