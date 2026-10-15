@@ -421,14 +421,9 @@ int s2n_ktls_record_writev(struct s2n_connection *conn, uint8_t content_type,
     return to_write;
 }
 
-int s2n_sendfile(struct s2n_connection *conn, int in_fd, off_t offset, size_t count,
+static int s2n_sendfile_impl(struct s2n_connection *conn, int in_fd, off_t offset, size_t count,
         size_t *bytes_written, s2n_blocked_status *blocked)
 {
-    POSIX_ENSURE_REF(blocked);
-    *blocked = S2N_BLOCKED_ON_WRITE;
-    POSIX_ENSURE_REF(bytes_written);
-    *bytes_written = 0;
-    POSIX_ENSURE_REF(conn);
     POSIX_ENSURE(conn->ktls_send_enabled, S2N_ERR_KTLS_UNSUPPORTED_CONN);
     POSIX_GUARD_RESULT(s2n_ktls_key_update_send(conn, count));
 
@@ -448,6 +443,25 @@ int s2n_sendfile(struct s2n_connection *conn, int in_fd, off_t offset, size_t co
     POSIX_GUARD_RESULT(s2n_ktls_set_estimated_sequence_number(conn, *bytes_written));
     *blocked = S2N_NOT_BLOCKED;
     return S2N_SUCCESS;
+}
+
+int s2n_sendfile(struct s2n_connection *conn, int in_fd, off_t offset, size_t count,
+        size_t *bytes_written, s2n_blocked_status *blocked)
+{
+    POSIX_ENSURE_REF(blocked);
+    *blocked = S2N_BLOCKED_ON_WRITE;
+    POSIX_ENSURE_REF(bytes_written);
+    *bytes_written = 0;
+    POSIX_ENSURE_REF(conn);
+    POSIX_ENSURE(s2n_connection_check_io_status(conn, S2N_IO_WRITABLE), S2N_ERR_CLOSED);
+
+    POSIX_ENSURE(!conn->send_in_use, S2N_ERR_REENTRANCY);
+    conn->send_in_use = true;
+
+    int result = s2n_sendfile_impl(conn, in_fd, offset, count, bytes_written, blocked);
+
+    conn->send_in_use = false;
+    return result;
 }
 
 /**
