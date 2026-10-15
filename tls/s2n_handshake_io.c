@@ -846,6 +846,19 @@ static const char *tls13_handshake_type_names[] = {
 #define CONNECTION_WRITER(conn)    (conn->mode == S2N_CLIENT ? 'C' : 'S')
 #define CONNECTION_IS_WRITER(conn) (ACTIVE_STATE(conn).writer == CONNECTION_WRITER(conn))
 
+/* A handshakes[]/tls13_handshakes[] row is defined iff the second entry
+ * (index 1) is not the all-zero sentinel. All intentionally initialized
+ * rows in both tables either start with { CLIENT_HELLO, SERVER_HELLO, ... }
+ * or { CLIENT_HELLO, CLIENT_CHANGE_CIPHER_SPEC, ... } or
+ * { CLIENT_HELLO, HELLO_RETRY_MSG, ... }, i.e. the entry at index 1 is
+ * never CLIENT_HELLO (which is message type 0 and therefore equal to the
+ * zero-initialized sentinel used by unused rows). This matches the
+ * `invalid_handshake` sentinel used by the unit tests (tests/unit/
+ * s2n_tls12_handshake_test.c:26 and tests/unit/
+ * s2n_tls13_handshake_state_machine_test.c:32). */
+#define IS_DEFINED_HANDSHAKE(conn) \
+    (ACTIVE_HANDSHAKES(conn)[(conn)->handshake.handshake_type][1] != CLIENT_HELLO)
+
 /* Only used in our test cases. */
 message_type_t s2n_conn_get_current_message_type(const struct s2n_connection *conn)
 {
@@ -854,6 +867,15 @@ message_type_t s2n_conn_get_current_message_type(const struct s2n_connection *co
 
 static int s2n_advance_message(struct s2n_connection *conn)
 {
+    POSIX_ENSURE_REF(conn);
+
+    /* Refuse to drive the state machine from an undefined handshakes[] row.
+     * Without this guard, an undefined handshake_type (e.g. CLIENT_AUTH
+     * without FULL_HANDSHAKE on the TLS1.2 path) would be interpreted as a
+     * row of 32 CLIENT_HELLO entries, and incrementing message_number past
+     * 32 would index past the end of the row. */
+    POSIX_ENSURE(IS_DEFINED_HANDSHAKE(conn), S2N_ERR_HANDSHAKE_STATE);
+
     /* Get the mode: 'C'lient or 'S'erver */
 #ifndef _WIN32
     char previous_writer = ACTIVE_STATE(conn).writer;
@@ -863,9 +885,18 @@ static int s2n_advance_message(struct s2n_connection *conn)
     /* Actually advance the message number */
     conn->handshake.message_number++;
 
+    /* Bound the message_number so an undefined handshake definition can
+     * never cause ACTIVE_MESSAGE()/ACTIVE_STATE() to index past the end of
+     * a handshakes[] row. s2n_handshake_validate() applies the same bound
+     * but is RESULT_DEBUG_ENSURE and therefore compiled out in release
+     * builds; this is the non-debug equivalent on the advance path. */
+    POSIX_ENSURE(conn->handshake.message_number >= 0, S2N_ERR_HANDSHAKE_STATE);
+    POSIX_ENSURE(conn->handshake.message_number < S2N_MAX_HANDSHAKE_LENGTH, S2N_ERR_HANDSHAKE_STATE);
+
     /* When reading and using TLS1.3, skip optional change_cipher_spec states. */
     if (ACTIVE_STATE(conn).writer != this_mode && EXPECTED_RECORD_TYPE(conn) == TLS_CHANGE_CIPHER_SPEC && IS_TLS13_HANDSHAKE(conn)) {
         conn->handshake.message_number++;
+        POSIX_ENSURE(conn->handshake.message_number < S2N_MAX_HANDSHAKE_LENGTH, S2N_ERR_HANDSHAKE_STATE);
     }
 
 #ifndef _WIN32
@@ -1039,13 +1070,13 @@ int s2n_conn_set_handshake_type(struct s2n_connection *conn)
     s2n_cert_auth_type client_cert_auth_type = 0;
     POSIX_GUARD(s2n_connection_get_client_auth_type(conn, &client_cert_auth_type));
 
-    if (conn->mode == S2N_CLIENT && client_cert_auth_type == S2N_CERT_AUTH_REQUIRED) {
-        /* If we're a client, and Client Auth is REQUIRED, then the Client must expect the CLIENT_CERT_REQ Message */
-        POSIX_GUARD_RESULT(s2n_handshake_type_set_flag(conn, CLIENT_AUTH));
-    } else if (conn->mode == S2N_SERVER && client_cert_auth_type != S2N_CERT_AUTH_NONE) {
-        /* If we're a server, and Client Auth is REQUIRED or OPTIONAL, then the server must send the CLIENT_CERT_REQ Message*/
-        POSIX_GUARD_RESULT(s2n_handshake_type_set_flag(conn, CLIENT_AUTH));
-    }
+    /* CLIENT_AUTH must only be set when FULL_HANDSHAKE is set, otherwise
+     * handshakes[handshake_type] selects a row that has no definition in the
+     * handshakes[] table and the handshake state machine is driven off a
+     * zero-initialized row. The CLIENT_AUTH decision is therefore made below,
+     * after any resumption early-returns and after FULL_HANDSHAKE has been
+     * set. This matches the TLS1.3 behavior in s2n_conn_set_tls13_handshake_type(),
+     * which only sets CLIENT_AUTH when IS_FULL_HANDSHAKE(conn). */
 
     if (conn->npn_negotiated) {
         POSIX_GUARD_RESULT(s2n_handshake_type_set_tls12_flag(conn, WITH_NPN));
@@ -1094,6 +1125,15 @@ int s2n_conn_set_handshake_type(struct s2n_connection *conn)
 
 skip_cache_lookup:
     if (conn->mode == S2N_CLIENT && conn->client_session_resumed == 1) {
+        /* s2n does not support TLS1.2 abbreviated (resumed) handshakes with
+         * client auth: the handshakes[] table has no definition for a row
+         * with CLIENT_AUTH that lacks FULL_HANDSHAKE, and using such a row
+         * would drive the state machine off an all-zero entry. Mirrors the
+         * TLS1.3 PSK behavior in s2n_client_psk_recv_identities() and the
+         * TLS1.2 server behavior in s2n_allowed_to_cache_connection() /
+         * s2n_client_session_ticket_recv(). */
+        POSIX_ENSURE(client_cert_auth_type != S2N_CERT_AUTH_REQUIRED,
+                S2N_ERR_INVALID_SESSION_TICKET);
         return S2N_SUCCESS;
     }
 
@@ -1102,6 +1142,16 @@ skip_cache_lookup:
 
     /* If we get this far, it's a full handshake */
     POSIX_GUARD_RESULT(s2n_handshake_type_set_flag(conn, FULL_HANDSHAKE));
+
+    /* CLIENT_AUTH is only valid in combination with FULL_HANDSHAKE (see the
+     * comment near the top of this function). */
+    if (conn->mode == S2N_CLIENT && client_cert_auth_type == S2N_CERT_AUTH_REQUIRED) {
+        /* If we're a client, and Client Auth is REQUIRED, then the Client must expect the CLIENT_CERT_REQ Message */
+        POSIX_GUARD_RESULT(s2n_handshake_type_set_flag(conn, CLIENT_AUTH));
+    } else if (conn->mode == S2N_SERVER && client_cert_auth_type != S2N_CERT_AUTH_NONE) {
+        /* If we're a server, and Client Auth is REQUIRED or OPTIONAL, then the server must send the CLIENT_CERT_REQ Message*/
+        POSIX_GUARD_RESULT(s2n_handshake_type_set_flag(conn, CLIENT_AUTH));
+    }
 
     bool is_ephemeral = false;
     POSIX_GUARD_RESULT(s2n_kex_is_ephemeral(conn->secure->cipher_suite->key_exchange_alg, &is_ephemeral));
