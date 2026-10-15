@@ -35,6 +35,15 @@
     case (error):           \
         RESULT_BAIL(S2N_ERR_NO_ALERT)
 
+/* Maximum number of warning-level alerts that will be silently ignored on
+ * a single connection when the application has opted in to
+ * S2N_ALERT_IGNORE_WARNINGS. Receiving more than this many warning
+ * alerts terminates the connection to prevent a peer from using a flood
+ * of 7-byte warning alert records to keep a non-progressing handshake
+ * loop alive indefinitely. A well-behaved peer should never produce
+ * anywhere near this many warning alerts on a single connection. */
+#define S2N_ALERT_IGNORE_LIMIT 100
+
 static S2N_RESULT s2n_translate_protocol_error_to_alert(int error_code, uint8_t *alert)
 {
     RESULT_ENSURE_REF(alert);
@@ -225,10 +234,18 @@ static bool s2n_alerts_supported(struct s2n_connection *conn)
 static bool s2n_process_as_warning(struct s2n_connection *conn, uint8_t level, uint8_t type)
 {
     /* Only TLS1.2 considers the alert level. The alert level field is
-     * considered deprecated in TLS1.3. If the protocol version has not
-     * been negotiated yet, we allow for warnings to avoid premature
-     * handshake failures before we know the protocol version. */
-    if (s2n_connection_get_protocol_version(conn) < S2N_TLS13 || !conn->actual_protocol_version_established) {
+     * deprecated in TLS1.3 and RFC 8446 section 6 requires that all alerts
+     * be treated as error alerts regardless of AlertLevel.
+     *
+     * s2n_connection_get_protocol_version() returns the highest supported
+     * protocol version (S2N_TLS13 for TLS1.3-capable connections) before
+     * negotiation has completed, so this check also applies the strict
+     * TLS1.3 rule to the pre-negotiation window on TLS1.3-capable
+     * endpoints. This prevents a peer from using plaintext warning-level
+     * alert records before ServerHello to suppress genuine alerts or to
+     * keep the handshake read loop alive indefinitely without state
+     * progress. */
+    if (s2n_connection_get_protocol_version(conn) < S2N_TLS13) {
         return level == S2N_TLS_ALERT_LEVEL_WARNING
                 && conn->config->alert_behavior == S2N_ALERT_IGNORE_WARNINGS;
     }
@@ -307,6 +324,21 @@ int s2n_process_alert_fragment(struct s2n_connection *conn)
 
     /* Ignore warning-level alerts if we're in warning-tolerant mode */
     if (s2n_process_as_warning(conn, conn->alert_in_data[0], conn->alert_in_data[1])) {
+        /* Bound the number of warning-level alerts that we silently
+         * ignore on a single connection. Without this limit, a peer could
+         * flood a connection with warning alert records (which require
+         * zero cryptographic work from the peer) to keep the handshake
+         * read loop alive forever without any state progress, holding
+         * the connection and its buffers allocated indefinitely. The
+         * limit is intentionally generous: a well-behaved peer should
+         * never generate anywhere near this many warning alerts, and
+         * exceeding it indicates abuse or a broken peer. */
+        if (conn->ignored_warning_alerts_received >= S2N_ALERT_IGNORE_LIMIT) {
+            POSIX_GUARD_RESULT(s2n_connection_set_closed(conn));
+            s2n_atomic_flag_set(&conn->error_alert_received);
+            POSIX_BAIL(S2N_ERR_ALERT);
+        }
+        conn->ignored_warning_alerts_received++;
         POSIX_GUARD(s2n_stuffer_wipe(&conn->alert_in));
         return 0;
     }

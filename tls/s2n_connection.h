@@ -272,6 +272,16 @@ struct s2n_connection {
     uint8_t alert_in_data[S2N_ALERT_LENGTH];
     struct s2n_stuffer alert_in;
 
+    /* Counts the number of warning-level alerts that have been silently
+     * ignored on this connection (only non-zero when
+     * alert_behavior == S2N_ALERT_IGNORE_WARNINGS). A compromised or
+     * malicious peer could otherwise flood a connection with warning
+     * alert records to keep the handshake read loop alive without making
+     * any state progress; this counter bounds how many such ignored
+     * alerts a single connection will tolerate before failing.
+     */
+    uint16_t ignored_warning_alerts_received;
+
     /* Both readers and writers can trigger alerts.
      * We prioritize writer alerts over reader alerts.
      */
