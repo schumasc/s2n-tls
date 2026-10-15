@@ -51,6 +51,11 @@ impl ReceiverSecrets {
 
         for epoch_secret in key_map.values() {
             let psk_identity = PskIdentity::new(client_identity.session_name.blob(), epoch_secret)?;
+            // `PskIdentity`'s `PartialEq` implementation compares the
+            // secret-derived `kms_key_binder` in constant time via
+            // `aws_lc_rs::constant_time::verify_slices_are_equal`, which is
+            // required on this unauthenticated ClientHello code path to
+            // avoid leaking a byte-by-byte timing oracle on the binder.
             if psk_identity == client_identity {
                 let psk_secret =
                     epoch_secret.new_psk_secret(client_identity.session_name.blob())?;
