@@ -92,9 +92,25 @@ static S2N_RESULT s2n_early_data_validate(struct s2n_connection *conn)
      *# -  The selected ALPN [RFC7301] protocol, if any
      **/
     const size_t app_protocol_size = strlen(conn->application_protocol);
-    if (app_protocol_size > 0 || config->application_protocol.size > 0) {
-        RESULT_ENSURE_EQ(config->application_protocol.size, app_protocol_size + 1 /* null-terminating char */);
-        RESULT_ENSURE(s2n_constant_time_equals(config->application_protocol.data, (uint8_t *) conn->application_protocol, app_protocol_size), S2N_ERR_SAFETY);
+    /* The stored application_protocol blob may have been produced by either:
+     *  - the resumption ticket deserializer, which stores exactly strlen() bytes (no NUL), or
+     *  - s2n_psk_set_application_protocol(), which copies size bytes verbatim and may
+     *    include a trailing NUL when callers pass sizeof("literal").
+     * To validate against RFC 8446 §4.2.10 ("The selected ALPN protocol, if any")
+     * using a single canonical representation, strip an optional trailing NUL from
+     * the stored blob, then require the lengths to match exactly and constant-time
+     * compare the full remaining stored blob. Fail closed if a non-empty stored
+     * protocol is paired with an empty negotiated protocol.
+     */
+    size_t stored_size = config->application_protocol.size;
+    if (stored_size > 0 && config->application_protocol.data[stored_size - 1] == '\0') {
+        stored_size -= 1;
+    }
+    if (app_protocol_size > 0 || stored_size > 0) {
+        /* Negotiated ALPN empty implies stored protocol must also be empty. */
+        RESULT_ENSURE_GT(app_protocol_size, 0);
+        RESULT_ENSURE_EQ(stored_size, app_protocol_size);
+        RESULT_ENSURE(s2n_constant_time_equals(config->application_protocol.data, (uint8_t *) conn->application_protocol, stored_size), S2N_ERR_SAFETY);
     }
 
     return S2N_RESULT_OK;
