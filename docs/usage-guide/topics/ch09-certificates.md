@@ -57,7 +57,7 @@ Client authentication is not enabled by default. However, the server can require
 
 Client authentication can be configured by calling `s2n_config_set_client_auth_type()` or `s2n_connection_set_client_auth_type()` for both the client and server. Additionally, the client will need to load a certificate and key pair as described for the server in [Server Authentication](#server-authentication) and the server will need to configure its trust store as described in [Configuring the Trust Store](#configuring-the-trust-store).
 
-When using client authentication, the server MUST implement the `s2n_verify_host_fn`, because the default behavior will likely reject all client certificates.
+When using client authentication, the server MUST implement the `s2n_verify_host_fn`, because the default behavior rejects all client certificates. In particular, the default callback fails closed on any server-mode connection: it will not derive a reference identity from the client-supplied SNI (`conn->server_name`), because that value is attacker-controlled on a server.
 
 When using client authentication with TLS1.3, `s2n_negotiate` will report a successful
 handshake to clients before the server validates the client certificate. If the server then
