@@ -197,24 +197,34 @@ static bool s2n_is_tls13_plaintext_content(struct s2n_connection *conn, uint8_t 
      *# The outer opaque_type field of a TLSCiphertext record
      *# is always set to the value 23 (application_data)
      *
-     * Plaintext alerts are only valid during the handshake (e.g., if
-     * certificate validation fails before encryption is established).
-     * After the handshake completes, RFC 8446 Section 5.2 requires all
-     * records to be encrypted, so post-handshake alerts must arrive as
-     * APPLICATION_DATA records with an inner content type of ALERT.
-     *
-     * Accepting plaintext alerts post-handshake would allow an on-path
-     * attacker to flip the outer content_type of an encrypted record
-     * from APPLICATION_DATA (0x17) to ALERT (0x15), routing the raw
-     * AEAD ciphertext through the null cipher and into the alert parser.
-     * If the first two ciphertext bytes happen to form a close_notify
-     * (probability 1/256) or user_canceled (probability 1/256), the
-     * record is silently consumed — either as a fake shutdown or as a
-     * discarded warning — without incrementing the AEAD sequence number.
-     * This enables repeated, non-desynchronizing attempts at targeted
-     * connection kills or silent record drops.
+     * Plaintext alerts and CCS records are only valid before record
+     * protection keys have been installed on the receiving side (e.g.,
+     * if certificate validation fails before encryption is established,
+     * or the middlebox-compatibility CCS described in RFC 8446 Section 5
+     * / Appendix D.4). Once handshake traffic keys are installed, RFC
+     * 8446 Section 5 requires every record to be protected, so every
+     * record — including ALERT and CHANGE_CIPHER_SPEC — must pass AEAD
+     * verification. We therefore gate the plaintext bypass on whether
+     * the reading side's crypto parameters are still the initial/null
+     * cipher, rather than on handshake completion. s2n_handshake_is_
+     * complete() only returns true once the entire handshake is done,
+     * but handshake traffic keys are installed much earlier (as soon as
+     * the client processes the ServerHello, and as soon as the server
+     * finishes sending its first flight). Routing ALERT/CCS records
+     * through the null cipher during that window would let an on-path
+     * attacker inject an unauthenticated 7-byte record and either abort
+     * the in-progress handshake with an attacker-chosen alert code or
+     * desynchronize the peers via a spurious CCS.
      */
-    if (content_type == TLS_ALERT && !s2n_handshake_is_complete(conn)) {
+    const struct s2n_crypto_parameters *read_params =
+            (conn->mode == S2N_CLIENT) ? conn->server : conn->client;
+    if (read_params == NULL || read_params->cipher_suite == NULL
+            || read_params->cipher_suite->record_alg == NULL
+            || read_params->cipher_suite->record_alg->cipher != &s2n_null_cipher) {
+        return false;
+    }
+
+    if (content_type == TLS_ALERT) {
         return true;
     }
 
@@ -225,13 +235,8 @@ static bool s2n_is_tls13_plaintext_content(struct s2n_connection *conn, uint8_t 
      *# at any time after the first ClientHello message has been
      *# sent or received and before the peer's Finished message has
      *# been received
-     *
-     * CCS is only valid during the handshake. Once the handshake is
-     * complete, a CCS record is a protocol violation and must not be
-     * routed through the plaintext path, as that would allow it to
-     * bypass the content_type validation in s2n_record_parse.
      */
-    if (content_type == TLS_CHANGE_CIPHER_SPEC && !s2n_handshake_is_complete(conn)) {
+    if (content_type == TLS_CHANGE_CIPHER_SPEC) {
         return true;
     }
 

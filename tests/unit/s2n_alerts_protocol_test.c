@@ -396,21 +396,32 @@ int main(int argc, char **argv)
             EXPECT_SUCCESS(s2n_stuffer_write_bytes(input, close_notify, sizeof(close_notify)));
 
             /* Receive close_notify.
-             * During the handshake, plaintext alerts are valid.
-             * After the handshake, plaintext alerts are rejected per
-             * RFC 8446 Section 5.2 — all post-handshake records must
-             * be encrypted.
+             *
+             * Plaintext alerts are only valid while the receiver's read-side
+             * handshake keys have not yet been installed. After keys are
+             * installed (for the client, once ServerHello has been processed),
+             * plaintext alerts — including those with an outer content_type
+             * of TLS_ALERT — must be rejected per RFC 8446 Section 5.2.
+             *
+             * At the SERVER_CERT handshake state, only the server-side read
+             * path is still unprotected; the client already has handshake
+             * traffic keys for its read side, so a plaintext alert injected
+             * towards the client is rejected as a bad outer content_type.
              */
             s2n_blocked_status blocked = S2N_NOT_BLOCKED;
-            if (type == S2N_TEST_DURING_HANDSHAKE) {
+            bool plaintext_alert_valid = (type == S2N_TEST_DURING_HANDSHAKE)
+                    && (receiver == server);
+            if (plaintext_alert_valid) {
                 EXPECT_FAILURE_WITH_ERRNO(s2n_negotiate(receiver, &blocked), S2N_ERR_CLOSED);
+            } else if (type == S2N_TEST_DURING_HANDSHAKE) {
+                EXPECT_FAILURE_WITH_ERRNO(s2n_negotiate(receiver, &blocked), S2N_ERR_BAD_MESSAGE);
             } else {
                 EXPECT_FAILURE_WITH_ERRNO(
                         s2n_recv(receiver, data, sizeof(data), &blocked),
                         S2N_ERR_BAD_MESSAGE);
             }
 
-            if (type == S2N_TEST_DURING_HANDSHAKE) {
+            if (plaintext_alert_valid) {
                 EXPECT_FALSE(s2n_connection_check_io_status(receiver, S2N_IO_READABLE));
 
                 /*
