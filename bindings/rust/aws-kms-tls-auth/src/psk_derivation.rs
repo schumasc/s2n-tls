@@ -53,7 +53,7 @@ use crate::{
     KeyArn,
 };
 use aws_lc_rs::{
-    digest::{self},
+    constant_time,
     hkdf,
     rand::SecureRandom,
 };
@@ -208,7 +208,15 @@ impl EpochSecret {
     }
 }
 
-#[derive(Clone, Hash, PartialEq, Eq)]
+/// `PskIdentity` holds the plaintext PSK identity sent in the ClientHello.
+///
+/// The `kms_key_binder` field is derived from the (secret) epoch secret and
+/// must therefore be compared in constant time. A manual `PartialEq`
+/// implementation is provided for that purpose; do **not** add
+/// `#[derive(PartialEq)]` here. `Hash` is intentionally not derived to
+/// prevent this value from being used as a key in hash-based collections
+/// (which would reintroduce non-constant-time comparisons).
+#[derive(Clone, Eq)]
 pub(crate) struct PskIdentity {
     version: PskVersion,
     /// the key epoch that was used to derive the daily secret
@@ -217,6 +225,29 @@ pub(crate) struct PskIdentity {
     pub session_name: PrefixedBlob<u16>,
     /// a value indicating the KMS key arn that was used
     kms_key_binder: PrefixedBlob<u16>,
+}
+
+impl PartialEq for PskIdentity {
+    /// Equality is checked in constant time with respect to the
+    /// secret-derived `kms_key_binder`.
+    ///
+    /// `version`, `key_epoch`, and `session_name` are public wire data and
+    /// are compared with ordinary equality; only `kms_key_binder` carries
+    /// secret-derived material and is compared with
+    /// `aws_lc_rs::constant_time::verify_slices_are_equal`.
+    fn eq(&self, other: &Self) -> bool {
+        if self.version != other.version
+            || self.key_epoch != other.key_epoch
+            || self.session_name.blob() != other.session_name.blob()
+        {
+            return false;
+        }
+        constant_time::verify_slices_are_equal(
+            self.kms_key_binder.blob(),
+            other.kms_key_binder.blob(),
+        )
+        .is_ok()
+    }
 }
 
 impl Debug for PskIdentity {
@@ -271,13 +302,35 @@ impl PskIdentity {
         })
     }
 
+    /// Derive the `kms_key_binder` with the keyed HKDF construction documented
+    /// in the crate README:
+    ///
+    /// ```text
+    /// kms_key_binder = HKDF-SHA384(
+    ///     ikm:  epoch_secret,
+    ///     salt: session_name,
+    ///     info: key_arn,
+    /// )
+    /// ```
+    ///
+    /// Using HKDF (HMAC-SHA384) with the epoch secret as the input keying
+    /// material and the per-connection `session_name` as the salt gives a
+    /// keyed MAC-like construction. HKDF's own encoding keeps the `salt`
+    /// and `info` inputs unambiguous, so the previous
+    /// `SHA384(secret || session_name || key_arn)` secret-prefix
+    /// construction (which had no length separation between inputs) is
+    /// avoided.
     fn kms_key_binder(session_name: &[u8], daily_secret: &EpochSecret) -> Vec<u8> {
-        let mut ctx = digest::Context::new(&digest::SHA384);
-        ctx.update(&daily_secret.secret);
-        ctx.update(session_name);
-        ctx.update(daily_secret.key_arn.as_bytes());
-        let kms_key_binder = ctx.finish();
-        kms_key_binder.as_ref().to_vec()
+        let salt = hkdf::Salt::new(hkdf::HKDF_SHA384, session_name);
+        let prk = salt.extract(&daily_secret.secret);
+        let info = [daily_secret.key_arn.as_bytes()];
+        let okm = prk
+            .expand(&info, hkdf::HKDF_SHA384.hmac_algorithm())
+            .expect("HKDF-SHA384 expand with a single 48-byte output cannot fail");
+        let mut binder = vec![0u8; SHA384_DIGEST_SIZE];
+        okm.fill(&mut binder)
+            .expect("HKDF-SHA384 fill into a 48-byte buffer cannot fail");
+        binder
     }
 }
 
@@ -368,18 +421,48 @@ mod tests {
         Ok(())
     }
 
-    /// The encoded PSK Identity from the 0.0.2 version of the library was checked
-    /// in. If we ever fail to deserialize this STOP! You are about to make a
-    /// breaking change. You must find a way to make your change backwards
-    /// compatible.
+    /// The canonical encoded PSK Identity derived with the current protocol
+    /// is checked in as a hex literal. If this test fails STOP! You are about
+    /// to make a wire-format breaking change. You must find a way to make
+    /// your change backwards compatible.
+    ///
+    /// NOTE: The `kms_key_binder` value below was regenerated when the
+    /// derivation moved from `SHA384(secret || session_name || key_arn)` to
+    /// the HKDF-SHA384 construction documented in the README. That was an
+    /// intentional, security-motivated protocol change (see CWE-208 / the
+    /// "constant-time binder" remediation). Any further change to the
+    /// derivation or on-wire layout must also be a conscious decision.
     #[test]
     fn backwards_compatibility() {
-        const ENCODED_IDENTITY: &[u8] = include_bytes!("../resources/psk_identity.bin");
+        // version(1) || key_epoch(8, be) ||
+        // session_name_len(2, be) || session_name(16) ||
+        // kms_key_binder_len(2, be) || kms_key_binder(48)
+        //
+        // Derived from:
+        //   secret       = b"secret material bytes"
+        //   key_arn      = "arn:1234:abcd"
+        //   key_epoch    = 123456
+        //   session_name = b"psk session name"
+        //   kms_key_binder = HKDF-SHA384(
+        //       ikm:  secret,
+        //       salt: session_name,
+        //       info: key_arn,
+        //   )
+        const ENCODED_IDENTITY_HEX: &str = concat!(
+            "02",
+            "000000000001e240",
+            "0010",
+            "70736b2073657373696f6e206e616d65",
+            "0030",
+            "1520d1ba3c6a7acdfdf5e027b35349005cfd61ad03192b6ab38ee5342b452f1f",
+            "abbe582f48b3184244656324daa29e2e",
+        );
         const SESSION_NAME: &[u8] = b"psk session name";
 
+        let encoded_identity = hex::decode(ENCODED_IDENTITY_HEX).unwrap();
         let identity = PskIdentity::new(SESSION_NAME, &test_epoch_secret()).unwrap();
 
-        let deserialized_identity = PskIdentity::decode_from_exact(ENCODED_IDENTITY).unwrap();
+        let deserialized_identity = PskIdentity::decode_from_exact(&encoded_identity).unwrap();
         assert_eq!(deserialized_identity, identity);
     }
 
