@@ -496,13 +496,15 @@ int s2n_free_stacktrace(void)
     S2N_ERROR(S2N_ERR_UNIMPLEMENTED);
 }
 
+/* No-op on platforms without execinfo. s2n_calculate_stacktrace() is
+ * invoked from inside the _S2N_ERROR macro, so it must never itself
+ * raise an s2n error - doing so would recurse into _S2N_ERROR and
+ * exhaust the thread stack. See s2n_print_stacktrace() below for the
+ * sibling no-op in the same build configuration.
+ */
 int s2n_calculate_stacktrace(void)
 {
-    if (!s_s2n_stack_traces_enabled) {
-        return S2N_SUCCESS;
-    }
-
-    S2N_ERROR(S2N_ERR_UNIMPLEMENTED);
+    return S2N_SUCCESS;
 }
 
 int s2n_get_stacktrace(struct s2n_stacktrace *trace)
