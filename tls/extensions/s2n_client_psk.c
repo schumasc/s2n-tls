@@ -336,6 +336,28 @@ static S2N_RESULT s2n_client_psk_recv_identities(struct s2n_connection *conn, st
 static S2N_RESULT s2n_client_psk_recv_binders(struct s2n_connection *conn, struct s2n_stuffer *extension)
 {
     RESULT_ENSURE_REF(conn);
+    RESULT_ENSURE_REF(extension);
+
+    /* Record the offset of the binder-list length field within the full
+     * ClientHello handshake message. The binder-list length field is read
+     * next, so the extension's current read_cursor points at it. The partial
+     * ClientHello that the binder authenticates is the prefix of the
+     * handshake message up to (but not including) this field. Deriving the
+     * truncation point from the actual position of the binder list - rather
+     * than from conn->handshake.io's write_cursor minus (binder_list_size + 2)
+     * - keeps the structural invariant that the binder covers "everything
+     * except the binder list" regardless of anything that appears after the
+     * pre_shared_key extension or any trailing bytes inside it.
+     */
+    const struct s2n_stuffer *client_hello = &conn->handshake.io;
+    const uint8_t *client_hello_base = client_hello->blob.data;
+    const uint8_t *binder_list_offset_ptr = extension->blob.data + extension->read_cursor;
+    RESULT_ENSURE_REF(client_hello_base);
+    RESULT_ENSURE_REF(binder_list_offset_ptr);
+    RESULT_ENSURE_GTE(binder_list_offset_ptr, client_hello_base);
+    uintptr_t binder_list_byte_offset = (uintptr_t) (binder_list_offset_ptr - client_hello_base);
+    RESULT_ENSURE_LTE(binder_list_byte_offset, client_hello->write_cursor);
+    uint32_t partial_client_hello_size = (uint32_t) binder_list_byte_offset;
 
     uint16_t binder_list_size = 0;
     RESULT_GUARD_POSIX(s2n_stuffer_read_uint16(extension, &binder_list_size));
@@ -350,13 +372,16 @@ static S2N_RESULT s2n_client_psk_recv_binders(struct s2n_connection *conn, struc
     RESULT_GUARD_POSIX(s2n_stuffer_init(&binder_list, &binder_list_blob));
     RESULT_GUARD_POSIX(s2n_stuffer_skip_write(&binder_list, binder_list_blob.size));
 
+    /* RFC 8446 4.2.11: the pre_shared_key extension consists of exactly the
+     * identity list followed by the binder list. Reject any trailing bytes
+     * inside the extension so that the transcript boundary computed above is
+     * authoritative.
+     */
+    RESULT_ENSURE_EQ(s2n_stuffer_data_available(extension), 0);
+
     /* Record the ClientHello message up to but not including the binder list.
      * This is required to calculate the binder for the chosen PSK. */
     struct s2n_blob partial_client_hello = { 0 };
-    const struct s2n_stuffer *client_hello = &conn->handshake.io;
-    uint32_t binders_size = binder_list_blob.size + SIZE_OF_BINDER_LIST_SIZE;
-    RESULT_ENSURE_GTE(client_hello->write_cursor, binders_size);
-    uint32_t partial_client_hello_size = client_hello->write_cursor - binders_size;
     RESULT_GUARD_POSIX(s2n_blob_slice(&client_hello->blob, &partial_client_hello, 0, partial_client_hello_size));
 
     return s2n_client_psk_recv_binder_list(conn, &partial_client_hello, &binder_list);

@@ -136,7 +136,15 @@ static int s2n_extension_parse(struct s2n_stuffer *in, s2n_parsed_extension *par
 
     s2n_extension_type_id extension_id = 0;
     if (s2n_extension_supported_iana_value_to_id(extension_type, &extension_id) != S2N_SUCCESS) {
-        /* Ignore unknown extensions */
+        /* Ignore unknown extensions, but still count their position on the wire.
+         * The wire index / total extension count is relied on by callers (e.g.
+         * the RFC 8446 pre_shared_key "MUST be the last extension" check in
+         * s2n_client_psk_recv()) to reason about an extension's actual position
+         * in the ClientHello extension vector, so unrecognized extensions must
+         * advance the counter too. Otherwise an unrecognized extension placed
+         * after pre_shared_key would be invisible to that check.
+         */
+        (*wire_index)++;
         return S2N_SUCCESS;
     }
 

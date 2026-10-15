@@ -286,7 +286,10 @@ int main()
         EXPECT_SUCCESS(s2n_extension_list_parse(&stuffer, &parsed_extension_list));
 
         EXPECT_EQUAL(s2n_stuffer_data_available(&stuffer), 0);
-        EXPECT_EQUAL(parsed_extension_list.count, 0);
+        /* Unknown extensions do not populate parsed_extensions, but they do
+         * still advance the wire index / total extension count.
+         */
+        EXPECT_EQUAL(parsed_extension_list.count, 1);
         EXPECT_PARSED_EXTENSION_LIST_EMPTY(parsed_extension_list);
         EXPECT_RAW_EQUAL(parsed_extension_list, stuffer);
 
@@ -370,7 +373,11 @@ int main()
         EXPECT_PARSED_EXTENSION_EQUAL(parsed_extension_list, test_extension_2.iana_value, test_data, 0);
         EXPECT_PARSED_EXTENSION_EQUAL(parsed_extension_list, test_extension_3.iana_value, other_test_data, sizeof(other_test_data));
         EXPECT_RAW_EQUAL(parsed_extension_list, stuffer);
-        EXPECT_EQUAL(parsed_extension_list.count, 3);
+        /* Unknown extensions are not stored, but they still advance the wire
+         * index / total extension count so that position-sensitive checks
+         * (e.g. the RFC 8446 pre_shared_key "last extension" check) see them.
+         */
+        EXPECT_EQUAL(parsed_extension_list.count, 4);
 
         CLEAR_PARSED_EXTENSION(parsed_extension_list, test_extension.iana_value);
         CLEAR_PARSED_EXTENSION(parsed_extension_list, test_extension_2.iana_value);
@@ -406,13 +413,18 @@ int main()
 
         EXPECT_SUCCESS(s2n_extension_list_parse(&stuffer, &parsed_extension_list));
 
+        /* Written order: test_extension, test_extension_2, UNKNOWN, test_extension_3.
+         * Unknown extensions still consume a wire index, so test_extension_3
+         * is at wire_index 3 (not 2) and the total count is 4.
+         */
         uint16_t expected_order[] = { test_extension.iana_value, test_extension_2.iana_value, test_extension_3.iana_value };
+        uint16_t expected_indexes[] = { 0, 1, 3 };
         for (size_t i = 0; i < s2n_array_len(expected_order); i++) {
             s2n_extension_type_id id = 0;
             EXPECT_SUCCESS(s2n_extension_supported_iana_value_to_id(expected_order[i], &id));
-            EXPECT_EQUAL(parsed_extension_list.parsed_extensions[id].wire_index, i);
+            EXPECT_EQUAL(parsed_extension_list.parsed_extensions[id].wire_index, expected_indexes[i]);
         }
-        EXPECT_EQUAL(parsed_extension_list.count, 3);
+        EXPECT_EQUAL(parsed_extension_list.count, 4);
 
         EXPECT_SUCCESS(s2n_stuffer_free(&stuffer));
     };
