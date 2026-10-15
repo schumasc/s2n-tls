@@ -1011,7 +1011,8 @@ typedef uint8_t (*s2n_verify_host_fn)(const char *host_name, size_t host_name_le
  *
  * The default behavior is to require that the hostname match the server name set with s2n_set_server_name().
  * This will likely lead to all client certificates being rejected, so the callback will need to be overridden when using
- *  client authentication.
+ *  client authentication. The default callback additionally fails closed in server mode: on a server connection it will
+ *  not use the client-supplied SNI (conn->server_name) as the reference identity for client certificates.
  *
  * This change will be inherited by s2n_connections using this config. If a separate callback for different connections
  * using the same config is desired, see s2n_connection_set_verify_host_callback().
@@ -2048,6 +2049,8 @@ S2N_API extern int s2n_connection_set_dynamic_record_threshold(struct s2n_connec
  *
  * The default behavior is to require that the hostname match the server name set with s2n_set_server_name(). This will
  * likely lead to all client certificates being rejected, so the callback will need to be overridden when using client authentication.
+ * The default callback additionally fails closed in server mode: on a server connection it will not use the client-supplied
+ * SNI (conn->server_name) as the reference identity for client certificates.
  *
  * If a single callback for different connections using the same config is desired, see s2n_config_set_verify_host_callback().
  *

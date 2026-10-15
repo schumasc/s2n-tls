@@ -226,6 +226,19 @@ static uint8_t s2n_default_verify_host(const char *host_name, size_t len, void *
 
     struct s2n_connection *conn = data;
 
+    /* On a server connection, conn->server_name is populated from the peer's
+     * ClientHello SNI extension, i.e. from the same peer whose certificate is
+     * being authenticated. Using it as the reference identity for a client
+     * certificate would let the peer choose both the certificate and the name
+     * it is checked against, so the default callback must fail closed in
+     * server mode. Applications that enable client authentication are required
+     * (see api/s2n.h and docs/usage-guide/topics/ch09-certificates.md) to
+     * install their own s2n_verify_host_fn that derives the reference identity
+     * from application-configured state. */
+    if (conn->mode == S2N_SERVER) {
+        return 0;
+    }
+
     if (conn->server_name[0] == '\0') {
         return 0;
     }
