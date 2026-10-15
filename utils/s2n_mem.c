@@ -86,8 +86,15 @@ static int s2n_mem_cleanup_impl(void)
     s2n_mem_malloc_cb = s2n_windows_mem_malloc_impl;
     s2n_mem_free_cb = s2n_windows_mem_free_impl;
 #else
-    s2n_mem_malloc_cb = s2n_mem_malloc_no_mlock_impl;
-    s2n_mem_free_cb = s2n_mem_free_no_mlock_impl;
+    /* Restore the compile-time POSIX defaults (mlock implementations), mirroring
+     * the _WIN32 branch above. Installing the no_mlock implementations here would
+     * leave the allocator in a weaker state than the operator requested after an
+     * s2n_cleanup_final()/s2n_init() cycle, because s2n_mem_init_impl() only ever
+     * downgrades to the no_mlock callbacks (when S2N_DONT_MLOCK is set or during
+     * unit tests) and never re-arms the mlock callbacks. See CWE-452/CWE-1188.
+     */
+    s2n_mem_malloc_cb = s2n_mem_malloc_mlock_impl;
+    s2n_mem_free_cb = s2n_mem_free_mlock_impl;
 #endif
     return S2N_SUCCESS;
 }
